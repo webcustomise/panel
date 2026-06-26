@@ -168,5 +168,9 @@
     console.log(DEV, '| files:', Object.keys(s.files).length, '| dirs:', Object.keys(s.dirs).length);
   };
 
+  window.startAuto  = startAuto;
+  window.statusAuto = statusAuto;
+  window.resetAuto  = resetAuto;
+
   log('ready → 1) Attack a user  2) myfiles  3) startAuto()');
 })();
