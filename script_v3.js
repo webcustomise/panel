@@ -1,10 +1,20 @@
 /**
- * DingDong One-Click Folder Export v5 — WhatsApp only
+ * DingDong One-Click Folder Export v6 — WhatsApp only, robust walker
  *
- * Walks every user → opens file manager → navigates to
- * Android/media/com.whatsapp → recursively downloads everything inside.
+ * Per user: opens file manager → cd Android/media/com.whatsapp →
+ * recursively walks EVERY subfolder and downloads EVERY file.
  *
- * Output: <picked-folder>/DingDong_WA_<ts>/<UID - label>/com.whatsapp/...
+ * Robustness fixes over v5:
+ *  - Tracks the absolute path of each folder (window.var32) and re-navigates
+ *    to it after every file preview + after every recursive return, because
+ *    the panel re-renders #resp <li> nodes and stale references silently
+ *    no-op.
+ *  - Re-snapshots entries by NAME every loop iteration.
+ *  - Uses setdatcmd("cd", absPath, "", respov) for reliable navigation
+ *    instead of clicking ".." (which sometimes lands in the wrong place).
+ *  - Waits for listing to actually change after each navigation.
+ *
+ * Output: <picked>/DingDong_WA_<ts>/<UID - label>/com.whatsapp/...
  */
 
 (function () {
@@ -12,12 +22,13 @@
 
   const CFG = {
     CLICK_SETTLE: 1500,
-    FOLDER_WAIT: 2200,
-    PREVIEW_TRIES: 12,
+    NAV_WAIT_MAX: 6000,     // max ms to wait for listing to refresh
+    NAV_POLL: 150,
+    PREVIEW_TRIES: 20,
     PREVIEW_STEP: 250,
-    MAX_DEPTH: 8,
+    MAX_DEPTH: 12,
     MAX_PARALLEL_DL: 4,
-    BETWEEN_FILES: 250,
+    BETWEEN_FILES: 200,
   };
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -63,7 +74,7 @@
         #dd-pick small{display:block;color:#888;margin-top:8px;font-size:10.5px;}
       </style>
       <header>
-        <span>🛰 DingDong WA Export</span>
+        <span>🛰 DingDong WA Export v6</span>
         <button id="dd-stop" style="display:none;background:#f55;color:#fff">Stop</button>
       </header>
       <div id="dd-pick">
@@ -92,7 +103,7 @@
 
   const sum = t => { const s = document.getElementById("dd-sum"); if (s) s.textContent = t; };
 
-  /* ---------- discover users (matches original page layout) ---------- */
+  /* ---------- discover users ---------- */
   function discover() {
     const out = [];
     document.querySelectorAll(".usr").forEach(div => {
@@ -110,6 +121,7 @@
   const $resp = () => document.getElementById("resp");
   const $fprev = () => document.getElementById("fprev");
   const fprevOpen = () => { const f = $fprev(); return f && getComputedStyle(f).display !== "none"; };
+
   const getEntries = () => {
     const r = $resp(); if (!r) return [];
     return Array.from(r.querySelectorAll("li"));
@@ -121,12 +133,56 @@
   };
   const isFolder = li => li.classList.contains("fo");
   const isBack = li => entryName(li).startsWith("..");
+  const curPath = () => (typeof window.var32 === "string" ? window.var32 : "");
 
   function closeFprev() {
     const f = $fprev(); if (!f) return;
     const x = f.querySelector("span.span");
     if (x) try { x.click(); } catch (_) {}
     f.style.display = "none";
+  }
+
+  /* ---------- absolute-path navigation ---------- */
+  async function cdAbs(absPath) {
+    if (typeof window.setdatcmd !== "function") {
+      warn("setdatcmd missing — cannot cd to", absPath);
+      return false;
+    }
+    const before = curPath();
+    const beforeSig = entriesSig();
+    try { window.setdatcmd("cd", absPath, "", window.respov); }
+    catch (e) { warn("cd threw", absPath, e); return false; }
+    // wait for var32 to update OR listing to change
+    const t0 = Date.now();
+    while (Date.now() - t0 < CFG.NAV_WAIT_MAX) {
+      await sleep(CFG.NAV_POLL);
+      if (curPath() === absPath || entriesSig() !== beforeSig) break;
+    }
+    await sleep(250); // tiny settle
+    if (curPath() && curPath() !== absPath) {
+      // some panels strip trailing slash; accept close matches
+      const a = absPath.replace(/\/+$/, ""), b = curPath().replace(/\/+$/, "");
+      if (a !== b) warn(`cd target ${absPath} but var32=${curPath()}`);
+    }
+    return true;
+  }
+
+  function entriesSig() {
+    return getEntries().map(li => (isFolder(li) ? "D:" : "F:") + entryName(li)).join("|");
+  }
+
+  async function clickFolderByName(name) {
+    const li = getEntries().find(x => isFolder(x) && entryName(x) === name);
+    if (!li) return false;
+    const beforeSig = entriesSig();
+    li.click();
+    const t0 = Date.now();
+    while (Date.now() - t0 < CFG.NAV_WAIT_MAX) {
+      await sleep(CFG.NAV_POLL);
+      if (entriesSig() !== beforeSig) break;
+    }
+    await sleep(250);
+    return true;
   }
 
   /* ---------- FS helpers ---------- */
@@ -147,17 +203,7 @@
     await w.close();
   }
 
-  /* ---------- navigate into a named subfolder ---------- */
-  async function enterFolder(name) {
-    const entries = getEntries();
-    const li = entries.find(x => isFolder(x) && entryName(x) === name);
-    if (!li) return false;
-    li.click();
-    await sleep(CFG.FOLDER_WAIT);
-    return true;
-  }
-
-  /* ---------- collect files for one user (WhatsApp only) ---------- */
+  /* ---------- collect files for one user ---------- */
   async function collectUser(u) {
     upd(u.uid, u.label, "selecting…", 4);
     u.btn.click();
@@ -166,49 +212,78 @@
     const fm = document.querySelector('[onclick="filesmanager()"]');
     if (!fm) { upd(u.uid, u.label, "⚠ no FM", 0); return []; }
     fm.click();
-    await sleep(CFG.FOLDER_WAIT);
+    await sleep(CFG.CLICK_SETTLE);
 
-    for (let i = 0; i < 12 && getEntries().length === 0; i++) await sleep(800);
+    // wait for first listing
+    const t0 = Date.now();
+    while (Date.now() - t0 < CFG.NAV_WAIT_MAX && getEntries().length === 0) await sleep(CFG.NAV_POLL);
 
-    // Navigate: Android → media → com.whatsapp
-    const path = ["Android", "media", "com.whatsapp"];
-    for (const folder of path) {
-      upd(u.uid, u.label, `→ ${folder}`, 10);
-      const ok = await enterFolder(folder);
+    // Navigate Android → media → com.whatsapp via folder clicks
+    for (const folder of ["Android", "media", "com.whatsapp"]) {
+      upd(u.uid, u.label, `→ ${folder}`, 8);
+      const ok = await clickFolderByName(folder);
       if (!ok) {
         upd(u.uid, u.label, `⚠ ${folder} not found`, 0);
-        warn(`[${u.uid}] folder "${folder}" not found`);
+        warn(`[${u.uid}] missing folder ${folder}`);
         return [];
       }
     }
 
-    // Now recursively walk everything inside com.whatsapp
+    const waRoot = curPath();
+    log(`[${u.uid}] com.whatsapp root =`, waRoot);
+    if (!waRoot) { upd(u.uid, u.label, "⚠ no abs path", 0); return []; }
+
     const files = [];
-    await walk(u, "com.whatsapp/", 0, files);
+    await walk(u, waRoot, "com.whatsapp/", 0, files);
     upd(u.uid, u.label, `${files.length} files queued`, files.length ? 30 : 0);
     return files;
   }
 
-  async function walk(u, path, depth, out) {
+  /**
+   * Walk a folder by its ABSOLUTE path. We re-cd into it before every
+   * operation that could mutate the listing (file preview, or returning
+   * from a child walk), so stale <li> references never bite us.
+   */
+  async function walk(u, absPath, relPath, depth, out) {
     if (!S.running || depth > CFG.MAX_DEPTH) return;
+
+    // Ensure we are in absPath and snapshot names
+    if (curPath().replace(/\/+$/, "") !== absPath.replace(/\/+$/, "")) {
+      await cdAbs(absPath);
+    }
 
     const snap = getEntries()
       .map(li => ({ name: entryName(li), folder: isFolder(li), back: isBack(li) }))
       .filter(e => e.name && !e.back);
 
+    log(`[${u.uid}] walk ${relPath} (${snap.length} entries, depth ${depth})`);
+    upd(u.uid, u.label, `📂 ${relPath} (${snap.length})`, Math.min(28, 10 + depth * 3));
+
     for (const meta of snap) {
       if (!S.running) return;
-      const li = getEntries().find(x => entryName(x) === meta.name && isFolder(x) === meta.folder);
-      if (!li) continue;
 
       if (meta.folder) {
-        upd(u.uid, u.label, `→ ${meta.name}`, 10 + depth * 4);
-        li.click();
-        await sleep(CFG.FOLDER_WAIT);
-        await walk(u, path + meta.name + "/", depth + 1, out);
-        await goUp();
+        // Build absolute path of the child
+        const childAbs = absPath.replace(/\/+$/, "") + "/" + meta.name;
+        // Navigate to it explicitly (don't rely on click-then-stale-list)
+        const okCd = await cdAbs(childAbs);
+        if (!okCd) {
+          // fallback: click by name from current snapshot
+          if (curPath().replace(/\/+$/, "") !== absPath.replace(/\/+$/, "")) await cdAbs(absPath);
+          await clickFolderByName(meta.name);
+        }
+        await walk(u, childAbs, relPath + meta.name + "/", depth + 1, out);
+        // Return to parent before next sibling
+        await cdAbs(absPath);
       } else {
+        // FILE: re-enter parent (preview/close can desync), then click fresh li
+        if (curPath().replace(/\/+$/, "") !== absPath.replace(/\/+$/, "")) {
+          await cdAbs(absPath);
+        }
+        const li = getEntries().find(x => !isFolder(x) && entryName(x) === meta.name);
+        if (!li) { warn(`[${u.uid}] file vanished: ${meta.name}`); continue; }
         li.click();
+
         let href = null;
         for (let i = 0; i < CFG.PREVIEW_TRIES; i++) {
           await sleep(CFG.PREVIEW_STEP);
@@ -217,25 +292,17 @@
           if (fprevOpen() && h && h !== "hh" && h !== "#" && !h.startsWith("javascript")) { href = h; break; }
         }
         if (href) {
-          out.push({ url: href, path: path + meta.name });
+          out.push({ url: href, path: relPath + meta.name });
           S.stats.totalFiles++;
-        } else warn(`[${u.uid}] no URL for ${meta.name}`);
+        } else warn(`[${u.uid}] no URL for ${relPath}${meta.name}`);
+
         closeFprev();
         await sleep(CFG.BETWEEN_FILES);
+        // After preview, the listing may have been re-rendered or path reset.
+        // Force back to absPath so the next iteration is clean.
+        await cdAbs(absPath);
       }
     }
-  }
-
-  async function goUp() {
-    const back = getEntries().find(li => isBack(li));
-    if (back) { back.click(); await sleep(CFG.FOLDER_WAIT); return; }
-    try {
-      if (typeof window.setdatcmd === "function" && typeof window.var32 === "string") {
-        const parent = window.var32.substr(0, window.var32.lastIndexOf("/")) || "/";
-        window.setdatcmd("cd", parent, "", window.respov);
-        await sleep(CFG.FOLDER_WAIT);
-      }
-    } catch (e) { warn("goUp failed", e); }
   }
 
   /* ---------- download + write to disk ---------- */
@@ -305,7 +372,12 @@
     let users = discover();
     for (let i = 0; i < 6 && users.length === 0; i++) { await sleep(1500); users = discover(); }
 
-    if (!users.length) { sum("❌ No users found — check the page layout."); log("No users found — check the page layout."); S.running = false; btn.disabled = false; btn.classList.remove("busy"); btn.textContent = "📁 Pick Folder & Start (again)"; return; }
+    if (!users.length) {
+      sum("❌ No users found.");
+      S.running = false;
+      btn.disabled = false; btn.classList.remove("busy"); btn.textContent = "📁 Pick Folder & Start (again)";
+      return;
+    }
 
     S.users = users;
     sum(`Found ${users.length} users — exporting WhatsApp…`);
