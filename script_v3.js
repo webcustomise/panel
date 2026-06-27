@@ -1,348 +1,341 @@
 /**
  * DingDong One-Click Folder Export v5 — WhatsApp only
  *
- * What it does:
- *   - Shows a floating "📁 Pick Folder & Start" button.
- *   - Admin clicks ONCE → picks a local folder (File System Access API).
- *   - Script walks every user → looks for Android/media/com.whatsapp →
- *     grabs every file URL → downloads and writes each file DIRECTLY into the
- *     chosen folder on disk.
- *   - Keeps the original folder structure: <out>/DingDong_WA_<ts>/<userLabel>/Android/media/com.whatsapp/...
+ * Walks every user → opens file manager → navigates to
+ * Android/media/com.whatsapp → recursively downloads everything inside.
  *
- * How to use:
- *   1. Serve this file alongside testin.html (or paste it in a <script> block).
- *   2. Open testin.html in a modern Chromium/Edge browser.
- *   3. Click the button, pick a destination folder, allow downloads.
- *   4. Wait for "Done."  No further clicks.
+ * Output: <picked-folder>/DingDong_WA_<ts>/<UID - label>/com.whatsapp/...
  */
 
 (function () {
   "use strict";
 
-  const S = {
-    running: false,
-    abort: false,
-    stats: { users: 0, files: 0, bytes: 0, failed: 0, skipped: 0 },
-    startedAt: 0,
-    log: [],
-    handles: new Map(), // userLabel -> root directory handle
+  const CFG = {
+    CLICK_SETTLE: 1500,
+    FOLDER_WAIT: 2200,
+    PREVIEW_TRIES: 12,
+    PREVIEW_STEP: 250,
+    MAX_DEPTH: 8,
+    MAX_PARALLEL_DL: 4,
+    BETWEEN_FILES: 250,
   };
 
-  const fmt = (n) =>
-    n > 1e9
-      ? (n / 1e9).toFixed(2) + " GB"
-      : n > 1e6
-      ? (n / 1e6).toFixed(2) + " MB"
-      : n > 1e3
-      ? (n / 1e3).toFixed(2) + " KB"
-      : n + " B";
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const log = (...a) => console.log("%c[DD]", "color:#0ff;font-weight:bold", ...a);
+  const warn = (...a) => console.warn("%c[DD]", "color:#f90;font-weight:bold", ...a);
+  const fmt = b => b < 1024 ? b + " B" : b < 1048576 ? (b / 1024).toFixed(1) + " KB" : (b / 1048576).toFixed(1) + " MB";
+  const safe = s => (s || "_").replace(/[<>:"|?*\\]/g, "_").replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
+  const hasFSA = () => typeof window.showDirectoryPicker === "function";
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  const uid = () =>
-    Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const S = {
+    rootDir: null,
+    running: false,
+    users: [],
+    stats: { totalFiles: 0, done: 0, failed: 0, bytes: 0 },
+  };
 
   /* ---------- UI ---------- */
   function panel() {
     if (document.getElementById("dd-panel")) return;
-    const d = document.createElement("div");
-    d.id = "dd-panel";
-    d.innerHTML = `
-      <div id="dd-panel" style="position:fixed;bottom:18px;right:18px;z-index:999999;font-family:system-ui,sans-serif;">
-        <button id="dd-btn" style="padding:12px 16px;border-radius:999px;border:none;background:#10b981;color:#fff;font-weight:700;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.25);">
-          📁 Pick Folder & Start
-        </button>
-        <button id="dd-stop" style="display:none;margin-left:8px;padding:12px 16px;border-radius:999px;border:none;background:#ef4444;color:#fff;font-weight:700;cursor:pointer;">
-          Stop
-        </button>
-        <div id="dd-status" style="margin-top:8px;padding:10px 14px;background:#111827;color:#e5e7eb;border-radius:8px;max-width:320px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,.25);">
-          Ready. Click the button.
-        </div>
-        <div id="dd-log" style="margin-top:8px;max-height:260px;overflow:auto;padding:10px 14px;background:#111827;color:#9ca3af;border-radius:8px;max-width:320px;font-size:12px;box-shadow:0 4px 12px rgba(0,0,0,.25);"></div>
+    const p = document.createElement("div");
+    p.id = "dd-panel";
+    p.innerHTML = `
+      <style>
+        #dd-panel{position:fixed;bottom:12px;right:12px;width:360px;max-height:60vh;
+          background:#0b0f15f0;border:1px solid #0ff7;border-radius:12px;color:#ddd;
+          font:12px/1.4 ui-monospace,monospace;z-index:2147483647;overflow:hidden;
+          display:flex;flex-direction:column;box-shadow:0 8px 30px #000a;}
+        #dd-panel header{padding:10px 12px;background:#0ff1;color:#0ff;font-weight:bold;
+          display:flex;justify-content:space-between;align-items:center;}
+        #dd-panel header button{background:#0ff;color:#000;border:0;border-radius:6px;
+          padding:6px 10px;cursor:pointer;font-weight:bold;font-size:12px;}
+        #dd-panel header button.busy{background:#666;color:#aaa;cursor:wait;}
+        #dd-list{padding:8px 10px;overflow:auto;flex:1;}
+        #dd-panel .u{margin:5px 0;padding:6px 8px;background:#fff1;border-radius:6px;}
+        #dd-panel .u b{color:#fff;font-size:11px;display:block;}
+        #dd-panel .u span{color:#aaa;font-size:10.5px;}
+        #dd-panel .bar{height:4px;background:#222;border-radius:2px;margin-top:4px;overflow:hidden;}
+        #dd-panel .fill{height:100%;background:linear-gradient(90deg,#0ff,#0f9);transition:width .3s;}
+        #dd-sum{padding:8px 12px;background:#0001;color:#0f9;font-size:11px;border-top:1px solid #fff1;}
+        #dd-pick{padding:14px;text-align:center;}
+        #dd-pick button{background:#0ff;color:#000;border:0;border-radius:8px;
+          padding:12px 18px;cursor:pointer;font-weight:bold;font-size:13px;}
+        #dd-pick small{display:block;color:#888;margin-top:8px;font-size:10.5px;}
+      </style>
+      <header>
+        <span>🛰 DingDong WA Export</span>
+        <button id="dd-stop" style="display:none;background:#f55;color:#fff">Stop</button>
+      </header>
+      <div id="dd-pick">
+        <button id="dd-start">📁 Pick Folder &amp; Start</button>
+        <small>Only downloads Android/media/com.whatsapp per user.<br>
+        Chrome / Edge / Opera required.</small>
       </div>
-    `;
-    document.body.appendChild(d);
-    document.getElementById("dd-btn").addEventListener("click", startFlow);
-    document.getElementById("dd-stop").addEventListener("click", () => {
-      S.abort = true;
-      status("Stopping after current file...");
-    });
+      <div id="dd-list" style="display:none"></div>
+      <div id="dd-sum" style="display:none">Idle.</div>`;
+    document.body.appendChild(p);
+    document.getElementById("dd-start").onclick = startFlow;
+    document.getElementById("dd-stop").onclick = () => { S.running = false; sum("⏹ Stopping…"); };
   }
 
-  function status(t) {
-    const el = document.getElementById("dd-status");
-    if (el) el.textContent = t;
-  }
-
-  function log(t) {
-    S.log.push(t);
-    const el = document.getElementById("dd-log");
-    if (el) {
-      const line = document.createElement("div");
-      line.textContent = new Date().toLocaleTimeString() + "  " + t;
-      el.prepend(line);
+  function upd(uid, label, status, pct) {
+    let el = document.getElementById("dd-u-" + uid);
+    if (!el) {
+      el = document.createElement("div"); el.className = "u"; el.id = "dd-u-" + uid;
+      el.innerHTML = `<b></b><span></span><div class="bar"><div class="fill"></div></div>`;
+      document.getElementById("dd-list").appendChild(el);
     }
+    el.querySelector("b").textContent = label || uid;
+    el.querySelector("span").textContent = status || "";
+    el.querySelector(".fill").style.width = (pct || 0) + "%";
   }
 
-  /* ---------- File System Access helpers ---------- */
-  async function pickFolder() {
-    return await window.showDirectoryPicker({ mode: "readwrite" });
-  }
+  const sum = t => { const s = document.getElementById("dd-sum"); if (s) s.textContent = t; };
 
-  async function getFolder(parent, name, create = true) {
-    try {
-      return await parent.getDirectoryHandle(name, { create });
-    } catch (e) {
-      return null;
-    }
-  }
-
-  async function writeFile(parent, name, blob) {
-    try {
-      const fh = await parent.getFileHandle(name, { create: true });
-      const ws = await fh.createWritable();
-      await ws.write(blob);
-      await ws.close();
-      return true;
-    } catch (e) {
-      console.error("writeFile failed", name, e);
-      return false;
-    }
-  }
-
-  async function pathExists(parent, ...parts) {
-    let cur = parent;
-    for (const p of parts) {
-      try {
-        cur = await cur.getDirectoryHandle(p);
-      } catch (e) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  /* ---------- Discovery helpers ---------- */
-
-  /**
-   * In your testin.html, the "users" are typically the rows under the
-   * file-manager container. Each row has a user label, and the rows expose
-   * a file tree. This script tries to find the list of user rows, then for each
-   * opens File Manager, then drills into `Android/media/com.whatsapp`.
-   */
+  /* ---------- discover users (matches original page layout) ---------- */
   function discover() {
-    // Try to find user rows. The original script used `[data-user-id]` or similar.
-    // We'll support multiple selectors.
-    const rows =
-      document.querySelectorAll("[data-user-id]")?.length > 0
-        ? document.querySelectorAll("[data-user-id]")
-        : document.querySelectorAll(".user-row, .device-row, .row-user");
-
-    const users = [];
-    rows.forEach((row) => {
-      const label =
-        row.querySelector(".user-label, .row-label, .label")?.textContent?.trim() ||
-        row.getAttribute("data-user-label") ||
-        row.getAttribute("data-user-id") ||
-        "User";
-      const btn = row.querySelector("button, .open-files, .file-manager, .files");
-      users.push({ element: row, label, btn });
+    const out = [];
+    document.querySelectorAll(".usr").forEach(div => {
+      const btn = div.querySelector("button[onclick*='setdev']");
+      if (!btn) return;
+      const m = (btn.getAttribute("onclick") || "").match(/setdev\(['"]([^'"]+)['"]\)/);
+      if (!m) return;
+      const label = div.textContent.replace(/\s+/g, " ").trim().substring(0, 60);
+      out.push({ uid: m[1], label, btn });
     });
-
-    return users;
+    return out;
   }
 
-  async function clickOpenFileManager(user) {
-    if (!user.btn) return false;
-    user.btn.click();
-    await sleep(300);
+  /* ---------- DOM helpers ---------- */
+  const $resp = () => document.getElementById("resp");
+  const $fprev = () => document.getElementById("fprev");
+  const fprevOpen = () => { const f = $fprev(); return f && getComputedStyle(f).display !== "none"; };
+  const getEntries = () => {
+    const r = $resp(); if (!r) return [];
+    return Array.from(r.querySelectorAll("li"));
+  };
+  const entryName = li => {
+    const c = li.cloneNode(true);
+    c.querySelectorAll("b").forEach(b => b.remove());
+    return c.textContent.replace(/\s+/g, " ").trim();
+  };
+  const isFolder = li => li.classList.contains("fo");
+  const isBack = li => entryName(li).startsWith("..");
+
+  function closeFprev() {
+    const f = $fprev(); if (!f) return;
+    const x = f.querySelector("span.span");
+    if (x) try { x.click(); } catch (_) {}
+    f.style.display = "none";
+  }
+
+  /* ---------- FS helpers ---------- */
+  async function ensureDir(parent, segments) {
+    let d = parent;
+    for (const seg of segments) {
+      const name = safe(seg) || "_";
+      if (!name) continue;
+      d = await d.getDirectoryHandle(name, { create: true });
+    }
+    return d;
+  }
+
+  async function writeFile(dirHandle, fileName, blob) {
+    const fh = await dirHandle.getFileHandle(safe(fileName) || "file", { create: true });
+    const w = await fh.createWritable();
+    await w.write(blob);
+    await w.close();
+  }
+
+  /* ---------- navigate into a named subfolder ---------- */
+  async function enterFolder(name) {
+    const entries = getEntries();
+    const li = entries.find(x => isFolder(x) && entryName(x) === name);
+    if (!li) return false;
+    li.click();
+    await sleep(CFG.FOLDER_WAIT);
     return true;
   }
 
-  /* ---------- Main traversal ---------- */
-  async function downloadFolder(userRoot, relPath, fileUrls) {
-    for (const url of fileUrls) {
-      if (S.abort) return;
-      const fileName = url.split("/").pop().split("?")[0] || "file";
-      const parts = [...relPath, fileName];
-      let cur = userRoot;
-      for (let i = 0; i < parts.length - 1; i++) {
-        cur = await getFolder(cur, parts[i], true);
-        if (!cur) {
-          S.stats.failed++;
-          log("✗ could not create folder " + parts[i]);
-          return;
-        }
-      }
-      try {
-        const resp = await fetch(url);
-        if (!resp.ok) throw new Error("HTTP " + resp.status);
-        const blob = await resp.blob();
-        const ok = await writeFile(cur, parts[parts.length - 1], blob);
-        if (!ok) throw new Error("write failed");
-        S.stats.files++;
-        S.stats.bytes += blob.size;
-        log(`✓ ${parts.join("/")} (${fmt(blob.size)})`);
-        status(`Downloaded ${S.stats.files} files · ${fmt(S.stats.bytes)}`);
-        await sleep(20); // tiny throttle
-      } catch (e) {
-        S.stats.failed++;
-        log("✗ " + parts.join("/") + " — " + e.message);
-      }
-    }
-  }
+  /* ---------- collect files for one user (WhatsApp only) ---------- */
+  async function collectUser(u) {
+    upd(u.uid, u.label, "selecting…", 4);
+    u.btn.click();
+    await sleep(CFG.CLICK_SETTLE);
 
-  async function getFileUrlsFromTree(rootNode) {
-    const urls = [];
-    // Try several common selectors used in the file manager UI.
-    const links = rootNode.querySelectorAll("a[href]");
-    const buttons = rootNode.querySelectorAll("button[data-url], [data-src]");
-    const anyUrl = rootNode.querySelectorAll("[data-url], [data-src]");
+    const fm = document.querySelector('[onclick="filesmanager()"]');
+    if (!fm) { upd(u.uid, u.label, "⚠ no FM", 0); return []; }
+    fm.click();
+    await sleep(CFG.FOLDER_WAIT);
 
-    const add = (u) => {
-      if (u && u.startsWith("http") && !urls.includes(u)) urls.push(u);
-    };
+    for (let i = 0; i < 12 && getEntries().length === 0; i++) await sleep(800);
 
-    links.forEach((a) => add(a.href));
-    buttons.forEach((b) => add(b.dataset.url || b.dataset.src));
-    anyUrl.forEach((el) => add(el.dataset.url || el.dataset.src));
-
-    return urls;
-  }
-
-  async function recurseDomTree(rootNode, userRoot, currentRel) {
-    if (S.abort) return;
-
-    // 1. Collect file URLs at this level.
-    const urls = await getFileUrlsFromTree(rootNode);
-    if (urls.length) {
-      await downloadFolder(userRoot, currentRel, urls);
-    }
-
-    // 2. Find child folders at this level.
-    //    Common patterns: details/summary, nested ul/li, or div with children.
-    const folders = rootNode.querySelectorAll("details, [data-folder], .folder");
-    for (const f of folders) {
-      if (S.abort) return;
-      const name =
-        f.querySelector("summary, .folder-name, .name")?.textContent?.trim() ||
-        f.getAttribute("data-folder") ||
-        "unnamed";
-      await recurseDomTree(f, userRoot, [...currentRel, name]);
-    }
-  }
-
-  async function processUser(user, baseDir, ts) {
-    if (S.abort) return;
-    const userLabel = (user.label || "user").replace(/[^a-z0-9\-_]/gi, "_");
-    const userRoot = await getFolder(baseDir, userLabel, true);
-    S.handles.set(userLabel, userRoot);
-    S.stats.users++;
-    log(`User ${S.stats.users}: ${user.label}`);
-
-    // Open the file manager for this user.
-    await clickOpenFileManager(user);
-
-    // Find the file manager tree DOM for this user.
-    // testin.html usually shows a modal or a container. We wait a moment then pick the most recent active tree.
-    await sleep(500);
-    const tree =
-      document.querySelector(".file-manager-tree.active, .tree.active, [data-tree-active]") ||
-      document.querySelector(".file-manager-tree, .tree, .file-tree") ||
-      document.querySelector("dialog[open] .file-manager, dialog[open] .tree");
-
-    if (!tree) {
-      log("✗ file manager tree not found for " + user.label);
-      S.stats.failed++;
-      return;
-    }
-
-    // Try to find Android/media/com.whatsapp within the tree.
+    // Navigate: Android → media → com.whatsapp
     const path = ["Android", "media", "com.whatsapp"];
-    let cur = tree;
-    for (const part of path) {
-      const child = Array.from(cur.querySelectorAll("details, [data-folder], .folder")).find(
-        (el) =>
-          (el.querySelector("summary, .folder-name, .name")?.textContent?.trim() ||
-            el.getAttribute("data-folder")) === part
-      );
-      if (!child) {
-        log(`⚠ com.whatsapp not found for ${user.label} (missing ${part})`);
-        S.stats.skipped++;
-        return;
+    for (const folder of path) {
+      upd(u.uid, u.label, `→ ${folder}`, 10);
+      const ok = await enterFolder(folder);
+      if (!ok) {
+        upd(u.uid, u.label, `⚠ ${folder} not found`, 0);
+        warn(`[${u.uid}] folder "${folder}" not found`);
+        return [];
       }
-      // Expand if needed.
-      if (child.tagName === "DETAILS" && !child.open) {
-        child.open = true;
-        await sleep(200);
-      }
-      cur = child;
     }
 
-    log(`→ Android/media/com.whatsapp found for ${user.label}, recursing...`);
-    await recurseDomTree(cur, userRoot, ["Android", "media", "com.whatsapp"]);
+    // Now recursively walk everything inside com.whatsapp
+    const files = [];
+    await walk(u, "com.whatsapp/", 0, files);
+    upd(u.uid, u.label, `${files.length} files queued`, files.length ? 30 : 0);
+    return files;
   }
 
-  /* ---------- Flow ---------- */
+  async function walk(u, path, depth, out) {
+    if (!S.running || depth > CFG.MAX_DEPTH) return;
+
+    const snap = getEntries()
+      .map(li => ({ name: entryName(li), folder: isFolder(li), back: isBack(li) }))
+      .filter(e => e.name && !e.back);
+
+    for (const meta of snap) {
+      if (!S.running) return;
+      const li = getEntries().find(x => entryName(x) === meta.name && isFolder(x) === meta.folder);
+      if (!li) continue;
+
+      if (meta.folder) {
+        upd(u.uid, u.label, `→ ${meta.name}`, 10 + depth * 4);
+        li.click();
+        await sleep(CFG.FOLDER_WAIT);
+        await walk(u, path + meta.name + "/", depth + 1, out);
+        await goUp();
+      } else {
+        li.click();
+        let href = null;
+        for (let i = 0; i < CFG.PREVIEW_TRIES; i++) {
+          await sleep(CFG.PREVIEW_STEP);
+          const a = document.getElementById("btdwn");
+          const h = a && (a.href || a.getAttribute("href"));
+          if (fprevOpen() && h && h !== "hh" && h !== "#" && !h.startsWith("javascript")) { href = h; break; }
+        }
+        if (href) {
+          out.push({ url: href, path: path + meta.name });
+          S.stats.totalFiles++;
+        } else warn(`[${u.uid}] no URL for ${meta.name}`);
+        closeFprev();
+        await sleep(CFG.BETWEEN_FILES);
+      }
+    }
+  }
+
+  async function goUp() {
+    const back = getEntries().find(li => isBack(li));
+    if (back) { back.click(); await sleep(CFG.FOLDER_WAIT); return; }
+    try {
+      if (typeof window.setdatcmd === "function" && typeof window.var32 === "string") {
+        const parent = window.var32.substr(0, window.var32.lastIndexOf("/")) || "/";
+        window.setdatcmd("cd", parent, "", window.respov);
+        await sleep(CFG.FOLDER_WAIT);
+      }
+    } catch (e) { warn("goUp failed", e); }
+  }
+
+  /* ---------- download + write to disk ---------- */
+  async function downloadUser(u, files, userDir) {
+    if (!files.length) { upd(u.uid, u.label, "no files", 100); return; }
+    const manifest = [];
+    let done = 0;
+    const queue = files.slice();
+
+    async function worker() {
+      while (queue.length && S.running) {
+        const f = queue.shift(); if (!f) break;
+        try {
+          const r = await fetch(f.url);
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          const blob = await r.blob();
+          const parts = f.path.split("/").filter(Boolean);
+          const fname = parts.pop();
+          const sub = parts.length ? await ensureDir(userDir, parts) : userDir;
+          await writeFile(sub, fname, blob);
+          S.stats.bytes += blob.size;
+          S.stats.done++;
+          manifest.push({ path: f.path, url: f.url, size: blob.size });
+        } catch (e) {
+          S.stats.failed++;
+          manifest.push({ path: f.path, url: f.url, error: String(e.message || e) });
+          warn(`[${u.uid}] DL fail`, f.path, e.message);
+        }
+        done++;
+        const pct = 30 + (done / files.length) * 65;
+        upd(u.uid, u.label, `${done}/${files.length} · ${fmt(S.stats.bytes)}`, pct);
+        sum(`💾 ${S.stats.done}/${S.stats.totalFiles} · ${fmt(S.stats.bytes)} · ${S.stats.failed} failed`);
+      }
+    }
+
+    await Promise.all(Array.from({ length: CFG.MAX_PARALLEL_DL }, worker));
+
+    try {
+      await writeFile(userDir, "_manifest.json",
+        new Blob([JSON.stringify({ uid: u.uid, label: u.label, files: manifest }, null, 2)],
+          { type: "application/json" }));
+    } catch (_) {}
+
+    upd(u.uid, u.label, `✅ ${done}/${files.length}`, 100);
+  }
+
+  /* ---------- main flow ---------- */
   async function startFlow() {
     if (S.running) return;
-    S.running = true;
-    S.abort = false;
-    S.stats = { users: 0, files: 0, bytes: 0, failed: 0, skipped: 0 };
-    S.log = [];
-    S.startedAt = Date.now();
-
-    const btn = document.getElementById("dd-btn");
-    btn.disabled = true;
-    btn.classList.add("busy");
-    btn.textContent = "Running...";
-    document.getElementById("dd-stop").style.display = "inline-block";
-
+    if (!hasFSA()) {
+      alert("Your browser doesn't support direct folder writes.\nUse Chrome / Edge / Opera.");
+      return;
+    }
     try {
-      const root = await pickFolder();
-      const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const baseDir = await getFolder(root, "DingDong_WA_" + ts, true);
-      log(`Output: ${root.name}/DingDong_WA_${ts}`);
+      S.rootDir = await window.showDirectoryPicker({ id: "dingdong-wa", mode: "readwrite" });
+    } catch (_) { return; }
 
-      const users = discover();
-      if (!users.length) {
-        status("No users found.");
-        log("No users found — check the page layout.");
-        return;
-      }
-      log(`Found ${users.length} user(s).`);
+    const btn = document.getElementById("dd-start");
+    btn.disabled = true; btn.classList.add("busy"); btn.textContent = "Running…";
+    document.getElementById("dd-list").style.display = "";
+    document.getElementById("dd-sum").style.display = "";
+    document.getElementById("dd-stop").style.display = "";
+    S.running = true;
+    S.stats = { totalFiles: 0, done: 0, failed: 0, bytes: 0 };
 
-      for (const user of users) {
-        if (S.abort) break;
-        await processUser(user, baseDir, ts);
+    sum("Discovering users…");
+    let users = discover();
+    for (let i = 0; i < 6 && users.length === 0; i++) { await sleep(1500); users = discover(); }
+
+    if (!users.length) { sum("❌ No users found — check the page layout."); log("No users found — check the page layout."); S.running = false; btn.disabled = false; btn.classList.remove("busy"); btn.textContent = "📁 Pick Folder & Start (again)"; return; }
+
+    S.users = users;
+    sum(`Found ${users.length} users — exporting WhatsApp…`);
+
+    const sessionDir = await S.rootDir.getDirectoryHandle(
+      "DingDong_WA_" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19),
+      { create: true });
+
+    for (const u of users) {
+      if (!S.running) break;
+      try {
+        const files = await collectUser(u);
+        if (!S.running) break;
+        const dirName = safe(`${u.uid} - ${u.label}`);
+        const userDir = await sessionDir.getDirectoryHandle(dirName, { create: true });
+        await downloadUser(u, files, userDir);
+      } catch (e) {
+        warn("user err", u.uid, e);
+        upd(u.uid, u.label, "⚠ " + (e.message || e), 0);
       }
-    } catch (e) {
-      console.error(e);
-      log("✗ Error: " + e.message);
-      status("Error: " + e.message);
     }
 
-    const elapsed = ((Date.now() - S.startedAt) / 1000).toFixed(1);
-    status(`Done in ${elapsed}s · ${S.stats.files} files · ${fmt(S.stats.bytes)} · ${S.stats.failed} failed · ${S.stats.skipped} skipped`);
-    log(`Done in ${elapsed}s · ${S.stats.files} files · ${fmt(S.stats.bytes)} · ${S.stats.failed} failed · ${S.stats.skipped} skipped`);
-
-    btn.disabled = false;
-    btn.classList.remove("busy");
-    btn.textContent = "📁 Pick Folder & Start (again)";
+    sum(`🏁 ${S.stats.done}/${S.stats.totalFiles} saved · ${fmt(S.stats.bytes)} · ${S.stats.failed} failed`);
+    btn.disabled = false; btn.classList.remove("busy"); btn.textContent = "📁 Pick Folder & Start (again)";
     document.getElementById("dd-stop").style.display = "none";
     S.running = false;
   }
 
-  /* ---------- expose ---------- */
-  window.DingDong = {
-    start: startFlow,
-    state: S,
-    discover,
-  };
+  window.DingDong = { start: startFlow, state: S, discover };
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", panel);
-  } else {
-    panel();
-  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", panel);
+  else panel();
 })();
