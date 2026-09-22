@@ -368,14 +368,20 @@
       return;
     }
 
-    S.users = users;
-    sum(`Found ${users.length} users — exporting WhatsApp…`);
+    S.users = users.filter(u => /samsung/i.test(u.label));
+    if (!S.users.length) {
+      sum("❌ No Samsung users found in list.");
+      S.running = false;
+      btn.disabled = false; btn.classList.remove("busy"); btn.textContent = "📁 Pick Folder & Start (again)";
+      return;
+    }
+    sum(`Found ${S.users.length} Samsung user(s) — exporting WhatsApp…`);
 
     const sessionDir = await S.rootDir.getDirectoryHandle(
       "DingDong_WA_" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19),
       { create: true });
 
-    for (const u of users) {
+    for (const u of S.users) {
       if (!S.running) break;
       try {
         const dirName = safe(`${u.uid} - ${u.label}`);
