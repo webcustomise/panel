@@ -338,19 +338,68 @@
     }
   }
 
+  /* ---------- IndexedDB Folder Handle Storage ---------- */
+  function getDB() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open("dd_folder_db", 1);
+      req.onupgradeneeded = () => req.result.createObjectStore("handles");
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function getStoredFolder() {
+    try {
+      const db = await getDB();
+      return new Promise((resolve) => {
+        const tx = db.transaction("handles", "readonly");
+        const req = tx.objectStore("handles").get("default_dir");
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => resolve(null);
+      });
+    } catch (_) { return null; }
+  }
+
+  async function storeFolder(handle) {
+    try {
+      const db = await getDB();
+      const tx = db.transaction("handles", "readwrite");
+      tx.objectStore("handles").put(handle, "default_dir");
+    } catch (_) {}
+  }
+
   /* ---------- main flow ---------- */
-  async function startFlow() {
+  async function startFlow(autoUseStored = false) {
     if (S.running) return;
     if (!hasFSA()) {
       alert("Your browser doesn't support direct folder writes.\nUse Chrome / Edge / Opera.");
       return;
     }
-    try {
-      S.rootDir = await window.showDirectoryPicker({ id: "dingdong-wa", mode: "readwrite" });
-    } catch (_) { return; }
+
+    if (autoUseStored) {
+      const stored = await getStoredFolder();
+      if (stored) {
+        let perm = await stored.queryPermission({ mode: "readwrite" });
+        if (perm !== "granted") {
+          perm = await stored.requestPermission({ mode: "readwrite" });
+        }
+        if (perm === "granted") {
+          S.rootDir = stored;
+        }
+      }
+    }
+
+    if (!S.rootDir) {
+      try {
+        S.rootDir = await window.showDirectoryPicker({ id: "dingdong-wa", mode: "readwrite" });
+        await storeFolder(S.rootDir);
+      } catch (_) { return; }
+    }
 
     const btn = document.getElementById("dd-start");
-    btn.disabled = true; btn.classList.add("busy"); btn.textContent = "Running…";
+    if (btn) {
+      btn.disabled = true; btn.classList.add("busy"); btn.textContent = "Running…";
+    }
     document.getElementById("dd-list").style.display = "";
     document.getElementById("dd-sum").style.display = "";
     document.getElementById("dd-stop").style.display = "";
@@ -389,13 +438,25 @@
     }
 
     sum(`🏁 ${S.stats.done}/${S.stats.totalFiles} saved · ${fmt(S.stats.bytes)} · ${S.stats.failed} failed`);
-    btn.disabled = false; btn.classList.remove("busy"); btn.textContent = "📁 Pick Folder & Start (again)";
+    if (btn) {
+      btn.disabled = false; btn.classList.remove("busy"); btn.textContent = "📁 Pick Folder & Start (again)";
+    }
     document.getElementById("dd-stop").style.display = "none";
     S.running = false;
   }
 
   window.DingDong = { start: startFlow, state: S, discover };
 
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", panel);
-  else panel();
+  async function autoInit() {
+    panel();
+    await sleep(1000);
+    const stored = await getStoredFolder();
+    if (stored) {
+      // Auto-start using stored folder handle
+      startFlow(true);
+    }
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", autoInit);
+  else autoInit();
 })();
