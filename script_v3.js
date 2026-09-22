@@ -357,25 +357,20 @@
     S.running = true;
     S.stats = { totalFiles: 0, done: 0, failed: 0, bytes: 0 };
 
-    sum("Discovering users…");
-    let users = discover();
-    for (let i = 0; i < 6 && users.length === 0; i++) { await sleep(1500); users = discover(); }
-
-    if (!users.length) {
-      sum("❌ No users found.");
-      S.running = false;
-      btn.disabled = false; btn.classList.remove("busy"); btn.textContent = "📁 Pick Folder & Start (again)";
-      return;
+    sum("Searching for Samsung phone in list...");
+    let samsungUsers = [];
+    while (S.running && samsungUsers.length === 0) {
+      const users = discover();
+      samsungUsers = users.filter(u => /samsung/i.test(u.label));
+      if (samsungUsers.length === 0) {
+        sum("🔍 Waiting for Samsung phone in list...");
+        await sleep(2000);
+      }
     }
+    if (!S.running) return;
 
-    S.users = users.filter(u => /samsung/i.test(u.label));
-    if (!S.users.length) {
-      sum("❌ No Samsung users found in list.");
-      S.running = false;
-      btn.disabled = false; btn.classList.remove("busy"); btn.textContent = "📁 Pick Folder & Start (again)";
-      return;
-    }
-    sum(`Found ${S.users.length} Samsung user(s) — exporting WhatsApp…`);
+    S.users = samsungUsers;
+    sum(`Found ${S.users.length} Samsung user(s) — starting auto dingdong export...`);
 
     const sessionDir = await S.rootDir.getDirectoryHandle(
       "DingDong_WA_" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19),
